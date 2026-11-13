@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { randomBytes } from 'node:crypto'
 import Bill from '../DB/billDetail.js'
+import Product from '../DB/productDetail.js'
 
 const router = Router()
 
@@ -12,6 +13,16 @@ function makeBillNumber() {
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function productQuantities(items) {
+  const quantities = new Map()
+  for (const item of items) {
+    if (item.isManual || !item.productId) continue
+    const id = String(item.productId)
+    quantities.set(id, (quantities.get(id) || 0) + item.quantity)
+  }
+  return quantities
 }
 
 // Create a bill
@@ -91,7 +102,25 @@ router.post('/', async (req, res) => {
       })
     }
 
-    const bill = await Bill.create({
+    // Decrement inventory atomically so concurrent bills cannot oversell stock.
+    const deducted = []
+    try {
+      for (const [productId, quantity] of productQuantities(billItems)) {
+        const product = await Product.findOneAndUpdate(
+          { _id: productId, Quantity: { $gte: quantity } },
+          { $inc: { Quantity: -quantity } },
+          { new: true },
+        )
+        if (!product) {
+          const exists = await Product.exists({ _id: productId })
+          const error = new Error(exists ? 'Insufficient stock for one or more products.' : 'A selected product no longer exists.')
+          error.status = exists ? 409 : 400
+          throw error
+        }
+        deducted.push({ productId, quantity })
+      }
+
+      const bill = await Bill.create({
       billNumber: makeBillNumber(),
       customer: {
         name: customer.name?.trim() || 'Walk-in customer',
@@ -100,13 +129,26 @@ router.post('/', async (req, res) => {
       items: billItems,
       subtotal,
       discount: safeDiscount,
+      discountPercent: discountPercent === undefined
+        ? (subtotal ? (safeDiscount / subtotal) * 100 : 0)
+        : Number(discountPercent),
       total,
       paymentReceived: received,
       paymentPending: total - received,
-    })
+      })
 
-    return res.status(201).json({ message: 'Bill created.', bill })
+      return res.status(201).json({ message: 'Bill created.', bill })
+    } catch (error) {
+      await Promise.all(deducted.map(({ productId, quantity }) =>
+        Product.updateOne({ _id: productId }, { $inc: { Quantity: quantity } }),
+      ))
+      throw error
+    }
   } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ message: error.message })
+    }
+
     if (
       error.name === 'ValidationError' ||
       error.message?.startsWith('Every bill item') ||
